@@ -31,8 +31,16 @@ async def quantize_endpoint(request: Request):
 
     phase = body.get("phase")
     if phase == "freeze":
+        candidates = body.get("candidates")
+        if not isinstance(candidates, list) or len(candidates) == 0:
+            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
         return handle_freeze(body)
     elif phase == "select":
+        candidates = body.get("candidates")
+        rows = body.get("rows")
+        policy = body.get("policy")
+        if not isinstance(candidates, list) or not isinstance(rows, list) or not isinstance(policy, dict):
+            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
         return handle_select(body)
     else:
         return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
@@ -44,37 +52,46 @@ def handle_freeze(body: Dict[str, Any]) -> JSONResponse:
     allowed_reasons = body.get("allowedUnsupportedReasons")
     candidates = body.get("candidates")
 
-    # Validation of required request fields
+    top_level_valid = True
     if not isinstance(freeze_id, str) or not (1 <= len(freeze_id) <= 128):
-        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+        top_level_valid = False
 
     if not isinstance(calib_dig, str) or len(calib_dig) == 0 or not isinstance(tok_dig, str) or len(tok_dig) == 0:
-        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+        top_level_valid = False
 
     if not isinstance(allowed_reasons, list) or not all(isinstance(r, str) and len(r) > 0 for r in allowed_reasons):
-        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-    if len(allowed_reasons) != len(set(allowed_reasons)):
-        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-
-    if not isinstance(candidates, list) or len(candidates) == 0:
-        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+        top_level_valid = False
+    elif len(allowed_reasons) != len(set(allowed_reasons)):
+        top_level_valid = False
 
     # Check Replay & Conflict
-    if freeze_id in STORE:
+    if top_level_valid and freeze_id in STORE:
         stored_entry = STORE[freeze_id]
         if stored_entry["request"] == body:
             return JSONResponse(status_code=200, content=stored_entry["response"])
         else:
             return JSONResponse(status_code=409, content={"error": "FREEZE_ID_CONFLICT"})
 
-    allowed_reasons_set = set(allowed_reasons)
-    cand_names_seen = set()
+    allowed_reasons_set = set(allowed_reasons) if isinstance(allowed_reasons, list) else set()
     processed_candidates = []
 
     for c in candidates:
         reason_codes = set()
+        if not top_level_valid:
+            reason_codes.add("INVALID_INPUT")
+
         if not isinstance(c, dict):
-            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+            cname = "unknown"
+            reason_codes.add("INVALID_INPUT")
+            processed_candidates.append({
+                "name": cname,
+                "status": "invalid",
+                "inventory": [],
+                "totalBytes": None,
+                "packageDigest": None,
+                "reasonCodes": sorted(list(reason_codes))
+            })
+            continue
 
         cname = c.get("name")
         cfiles = c.get("files")
@@ -83,15 +100,14 @@ def handle_freeze(body: Dict[str, Any]) -> JSONResponse:
         c_tok = c.get("tokenizerDigest")
         c_unsupported = c.get("unsupportedReason")
 
-        if not isinstance(cname, str) or len(cname) == 0 or cname in cand_names_seen:
-            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-        cand_names_seen.add(cname)
+        if not isinstance(cname, str) or len(cname) == 0:
+            reason_codes.add("INVALID_INPUT")
+            cname = str(cname) if cname is not None else "unknown"
 
         inventory = []
         total_bytes = None
         pkg_digest = None
 
-        # Files inventory calculation
         if not isinstance(cfiles, dict) or len(cfiles) == 0:
             reason_codes.add("INVALID_INPUT")
         else:
@@ -112,7 +128,6 @@ def handle_freeze(body: Dict[str, Any]) -> JSONResponse:
                 total_bytes = sum(item["bytes"] for item in inventory)
                 pkg_digest = hashlib.sha256(compact_json_bytes(inventory)).hexdigest()
 
-        # Status & Code determination
         status = "invalid"
         if isinstance(c_unsupported, str) and len(c_unsupported) > 0:
             if c_unsupported in allowed_reasons_set:
@@ -133,10 +148,11 @@ def handle_freeze(body: Dict[str, Any]) -> JSONResponse:
             else:
                 status = "invalid"
 
-        if status == "invalid" and "INVALID_INPUT" in reason_codes and not isinstance(cfiles, dict):
-            inventory = []
-            total_bytes = None
-            pkg_digest = None
+        if status == "invalid":
+            if not isinstance(cfiles, dict) or "INVALID_INPUT" in reason_codes:
+                inventory = []
+                total_bytes = None
+                pkg_digest = None
 
         sorted_codes = sorted(list(reason_codes), key=lambda x: x.encode("utf-8"))
 
@@ -149,18 +165,18 @@ def handle_freeze(body: Dict[str, Any]) -> JSONResponse:
             "reasonCodes": sorted_codes
         })
 
-    # Candidates sorted by name UTF-8 bytes
     processed_candidates.sort(key=lambda x: x["name"].encode("utf-8"))
 
     response_payload = {
-        "freezeId": freeze_id,
+        "freezeId": freeze_id if isinstance(freeze_id, str) else None,
         "candidates": processed_candidates
     }
 
-    STORE[freeze_id] = {
-        "request": body,
-        "response": response_payload
-    }
+    if top_level_valid and freeze_id:
+        STORE[freeze_id] = {
+            "request": body,
+            "response": response_payload
+        }
 
     return JSONResponse(status_code=200, content=response_payload)
 
@@ -171,12 +187,8 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
     latencies = body.get("latencies")
     rows = body.get("rows")
 
-    # Missing candidates, rows, or policy returns HTTP 400
-    if not isinstance(candidates, list) or not isinstance(rows, list) or not isinstance(policy, dict):
-        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-
     if not isinstance(freeze_id, str) or not (1 <= len(freeze_id) <= 128):
-        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+        freeze_id = str(freeze_id) if freeze_id is not None else ""
 
     max_bytes = policy.get("maxBytes")
     agg_floor = policy.get("aggregateFloor")
@@ -200,7 +212,6 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
                 policy_valid = False
                 break
 
-    # Lineage verification
     lineage_valid = True
     stored_candidates = None
 
@@ -212,7 +223,6 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
         if stored_candidates != candidates:
             lineage_valid = False
 
-    # Collect candidate names from supplied candidates
     cand_map: Dict[str, dict] = {}
     if isinstance(candidates, list):
         for c in candidates:
@@ -240,7 +250,6 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
         if not policy_valid:
             reason_codes.add("INVALID_POLICY")
 
-        # Manifest & Inventory recomputation
         total_bytes = None
         pkg_digest = None
         c_status = None
@@ -252,10 +261,9 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
                 total_bytes = sum(item.get("bytes", 0) for item in inv)
                 pkg_digest = hashlib.sha256(compact_json_bytes(inv)).hexdigest()
 
-        if total_bytes is None or pkg_digest is None or c_obj.get("packageDigest") != pkg_digest:
+        if total_bytes is None or pkg_digest is None or (c_obj and c_obj.get("packageDigest") != pkg_digest):
             reason_codes.add("INVALID_MANIFEST")
 
-        # Latency lookup
         c_latency = None
         if isinstance(latencies, dict):
             lat_val = latencies.get(cname)
@@ -265,7 +273,6 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
         if c_latency is None:
             reason_codes.add("INVALID_POLICY")
 
-        # Predictions & Accuracies
         preds_valid = True
         candidate_preds = []
 
@@ -327,7 +334,6 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
                         if s_acc < float(req_floor):
                             reason_codes.add(f"SLICE_FLOOR:{req_name}")
 
-        # Limits Check
         if policy_valid and total_bytes is not None and total_bytes > max_bytes:
             reason_codes.add("SIZE_LIMIT")
 
@@ -358,7 +364,6 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
     package_manifest = None
 
     if admitted_candidates:
-        # Tie-breaker: smaller bytes -> lower latency -> candidateOrder index
         admitted_candidates.sort(key=lambda x: (
             x["totalBytes"] if x["totalBytes"] is not None else float("inf"),
             x["latencyMs"] if x["latencyMs"] is not None else float("inf"),
@@ -368,7 +373,6 @@ def handle_select(body: Dict[str, Any]) -> JSONResponse:
         selected_name = winner["name"]
         package_manifest = winner["_raw_candidate_obj"]
 
-    # Format final results list (stripping internal sorting keys)
     final_results = []
     for r in results:
         final_results.append({
